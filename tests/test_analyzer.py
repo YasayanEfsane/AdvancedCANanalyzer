@@ -63,7 +63,36 @@ class AnalyzerTests(unittest.TestCase):
         rendered, _ = analyzer.process(frame)
         self.assertIsNone(rendered)
 
+    def test_watch_mode_displays_only_selected_ids(self) -> None:
+        filters = DynamicFilters()
+        filters.watch_ids.add(0x123)
+        analyzer = Analyzer(filters, use_color=False)
+        selected = parse_frame_line("S123:1:01,00,00,00,00,00,00,00", 1)
+        hidden = parse_frame_line("S124:1:01,00,00,00,00,00,00,00", 2)
+        assert selected is not None and hidden is not None
+        self.assertIsNotNone(analyzer.process(selected)[0])
+        self.assertIsNone(analyzer.process(hidden)[0])
+
+    def test_event_correlation_ranks_changed_bytes(self) -> None:
+        filters = DynamicFilters()
+        filters.rules[0x100] = FilterRule(ignored=True)
+        analyzer = Analyzer(filters, use_color=False)
+        baseline = parse_frame_line("S100:2:10,20,00,00,00,00,00,00", 1)
+        changed = parse_frame_line("S100:2:18,20,00,00,00,00,00,00", 2)
+        assert baseline is not None and changed is not None
+        analyzer.process(baseline)
+        analyzer.start_event("throttle", 5.0)
+        analyzer.process(changed)
+        report = analyzer.finish_event()
+        self.assertIn("event 'throttle' candidates", report)
+        self.assertIn("ID 0x100 byte 0", report)
+        self.assertIn("changes=1", report)
+
+    def test_empty_event_has_clear_report(self) -> None:
+        analyzer = Analyzer(DynamicFilters(), use_color=False)
+        analyzer.start_event("brake", 1.0)
+        self.assertIn("no byte changes", analyzer.finish_event())
+
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -130,6 +130,10 @@ class DynamicFilters:
         self.last_emit_ns: dict[int, int] = {}
         self.auto_ignore_above_hz: float | None = None
         self.changes_only = False
+        # An empty watch set means "show every ID". Once populated, it acts as
+        # a lightweight allow-list for console output only; CSV capture remains
+        # complete and is intentionally unaffected.
+        self.watch_ids: set[int] = set()
 
     def load(self, path: Path) -> None:
         document = json.loads(path.read_text(encoding="utf-8"))
@@ -142,6 +146,9 @@ class DynamicFilters:
         automatic = document.get("auto_ignore_above_hz")
         self.auto_ignore_above_hz = None if automatic is None else float(automatic)
         self.changes_only = bool(document.get("changes_only", False))
+        self.watch_ids = {
+            parse_can_id(str(item)) for item in document.get("watch_ids", [])
+        }
 
     def observe_rate(self, frame: CanFrame, now_ns: int) -> bool:
         """Return True exactly when an ID is newly auto-ignored."""
@@ -169,6 +176,8 @@ class DynamicFilters:
         return False
 
     def should_display(self, frame: CanFrame, changed: set[int], now_ns: int) -> bool:
+        if self.watch_ids and frame.can_id not in self.watch_ids:
+            return False
         rule = self.rules.get(frame.can_id)
         if rule is not None and rule.ignored:
             return False
@@ -335,12 +344,100 @@ class ReplayReader(threading.Thread):
                 self.stop_event.wait(self.interval_s)
 
 
+@dataclass(slots=True)
+class EventMetric:
+    changes: int = 0
+    total_delta: int = 0
+    bit_flips: int = 0
+    minimum: int = 0xFF
+    maximum: int = 0
+
+
+@dataclass(slots=True)
+class EventSession:
+    label: str
+    deadline_ns: int
+    metrics: dict[tuple[int, int], EventMetric] = field(default_factory=dict)
+
+
 class Analyzer:
     def __init__(self, filters: DynamicFilters, use_color: bool) -> None:
         self.filters = filters
         self.use_color = use_color
         self.last_displayed: dict[int, tuple[int, ...]] = {}
+        # Correlation observes valid frames before console filters are applied.
+        self.last_observed: dict[int, tuple[int, ...]] = {}
+        self.event_session: EventSession | None = None
         self.displayed = 0
+
+    def start_event(self, label: str, duration_s: float = 5.0) -> str:
+        label = label.strip()
+        if not label:
+            raise ValueError("event label cannot be empty")
+        if not 0.2 <= duration_s <= 60.0:
+            raise ValueError("duration must be between 0.2 and 60 seconds")
+        self.event_session = EventSession(
+            label=label,
+            deadline_ns=time.monotonic_ns() + int(duration_s * 1_000_000_000),
+        )
+        return f"event '{label}' armed for {duration_s:g}s; perform the action now"
+
+    def observe_event(self, frame: CanFrame, now_ns: int) -> str | None:
+        previous = self.last_observed.get(frame.can_id)
+        self.last_observed[frame.can_id] = frame.data
+        session = self.event_session
+        if session is None:
+            return None
+        if now_ns >= session.deadline_ns:
+            return self.finish_event()
+        if previous is None:
+            return None
+
+        for index in range(frame.dlc):
+            before, after = previous[index], frame.data[index]
+            if before == after:
+                continue
+            metric = session.metrics.setdefault((frame.can_id, index), EventMetric())
+            metric.changes += 1
+            metric.total_delta += abs(after - before)
+            metric.bit_flips += (before ^ after).bit_count()
+            metric.minimum = min(metric.minimum, before, after)
+            metric.maximum = max(metric.maximum, before, after)
+        return None
+
+    def finish_event(self, limit: int = 10) -> str:
+        session = self.event_session
+        if session is None:
+            return "no active event"
+        self.event_session = None
+        ranked = sorted(
+            session.metrics.items(),
+            key=lambda item: (
+                item[1].changes,
+                item[1].maximum - item[1].minimum,
+                item[1].bit_flips,
+                item[1].total_delta,
+            ),
+            reverse=True,
+        )[:limit]
+        if not ranked:
+            return f"event '{session.label}' complete: no byte changes observed"
+
+        rows = [f"event '{session.label}' candidates:"]
+        for rank, ((can_id, index), metric) in enumerate(ranked, 1):
+            rows.append(
+                f"  {rank}. ID 0x{can_id:X} byte {index}: "
+                f"changes={metric.changes}, range={metric.minimum:02X}-"
+                f"{metric.maximum:02X}, bit_flips={metric.bit_flips}"
+            )
+        return "\n".join(rows)
+
+    def cancel_event(self) -> str:
+        if self.event_session is None:
+            return "no active event"
+        label = self.event_session.label
+        self.event_session = None
+        return f"event '{label}' cancelled"
 
     def differences(self, frame: CanFrame) -> tuple[set[int], tuple[int, ...] | None]:
         previous = self.last_displayed.get(frame.can_id)
@@ -354,20 +451,23 @@ class Analyzer:
 
     def process(self, frame: CanFrame) -> tuple[str | None, str | None]:
         now_ns = time.monotonic_ns()
-        auto_notice = None
+        notices: list[str] = []
+        event_notice = self.observe_event(frame, now_ns)
+        if event_notice:
+            notices.append(event_notice)
         if self.filters.observe_rate(frame, now_ns):
-            auto_notice = (
+            notices.append(
                 f"auto-ignored 0x{frame.can_id:X} at "
                 f"{self.filters.rate_windows[frame.can_id].last_rate_hz:.1f} fps"
             )
 
         changed, previous = self.differences(frame)
         if not self.filters.should_display(frame, changed, now_ns):
-            return None, auto_notice
+            return None, "\n".join(notices) if notices else None
 
         self.last_displayed[frame.can_id] = frame.data
         self.displayed += 1
-        return self.format(frame, changed, previous), auto_notice
+        return self.format(frame, changed, previous), "\n".join(notices) if notices else None
 
     def format(self, frame: CanFrame, changed: set[int],
                previous: tuple[int, ...] | None) -> str:
@@ -404,6 +504,12 @@ HELP_TEXT = """Interactive commands (type a command and press Enter):
   auto-ignore HZ|off     auto-hide IDs measured above the threshold
   clear-auto             remove automatically created ignore rules
   changes-only on|off    show only frames changed since last display
+  watch ID               focus the console on one or more CAN IDs
+  unwatch ID             remove an ID from the focus set
+  watch-clear            disable focus mode and show all IDs
+  mark LABEL [SECONDS]   rank bytes changing during a labeled action
+  mark-stop              finish early and print event candidates
+  mark-cancel            discard the active event capture
   list                   show the dictionary-backed filter rules
   stats                  print reader and display counters
   help                   show this help
@@ -469,10 +575,30 @@ def handle_command(command: str, filters: DynamicFilters, stats: ReaderStats,
                 raise ValueError("use on or off")
             filters.changes_only = tokens[1].lower() == "on"
             return f"changes-only={'on' if filters.changes_only else 'off'}"
+        if verb == "watch" and len(tokens) == 2:
+            can_id = parse_can_id(tokens[1])
+            filters.watch_ids.add(can_id)
+            return f"watching 0x{can_id:X} ({len(filters.watch_ids)} ID(s))"
+        if verb == "unwatch" and len(tokens) == 2:
+            can_id = parse_can_id(tokens[1])
+            filters.watch_ids.discard(can_id)
+            state = "all IDs" if not filters.watch_ids else f"{len(filters.watch_ids)} ID(s)"
+            return f"stopped watching 0x{can_id:X}; showing {state}"
+        if verb == "watch-clear" and len(tokens) == 1:
+            count = len(filters.watch_ids)
+            filters.watch_ids.clear()
+            return f"focus mode disabled; cleared {count} watched ID(s)"
+        if verb == "mark" and len(tokens) in {2, 3}:
+            duration = 5.0 if len(tokens) == 2 else float(tokens[2])
+            return analyzer.start_event(tokens[1], duration)
+        if verb == "mark-stop" and len(tokens) == 1:
+            return analyzer.finish_event()
+        if verb == "mark-cancel" and len(tokens) == 1:
+            return analyzer.cancel_event()
         if verb == "list" and len(tokens) == 1:
-            if not filters.rules:
-                return "filter dictionary is empty"
             rows = []
+            watched = ", ".join(f"0x{can_id:X}" for can_id in sorted(filters.watch_ids))
+            rows.append(f"watch={watched or 'all IDs'}")
             for can_id, rule in sorted(filters.rules.items()):
                 rows.append(
                     f"0x{can_id:X}: ignored={rule.ignored}, "
@@ -501,6 +627,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log", type=Path, help="CSV path; display filters do not affect it")
     parser.add_argument("--config", type=Path, help="JSON filter configuration")
     parser.add_argument("--ignore", action="append", default=[], metavar="ID")
+    parser.add_argument("--watch", action="append", default=[], metavar="ID",
+                        help="show only selected CAN ID(s); may be repeated")
     parser.add_argument("--changes-only", action="store_true")
     parser.add_argument("--auto-ignore-hz", type=float)
     parser.add_argument("--queue-size", type=int, default=20000)
@@ -527,6 +655,8 @@ def run(arguments: argparse.Namespace) -> int:
         filters.load(arguments.config)
     for item in arguments.ignore:
         filters.rules.setdefault(parse_can_id(item), FilterRule()).ignored = True
+    for item in arguments.watch:
+        filters.watch_ids.add(parse_can_id(item))
     if arguments.changes_only:
         filters.changes_only = True
     if arguments.auto_ignore_hz is not None:
