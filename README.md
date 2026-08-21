@@ -327,6 +327,12 @@ CSV capture continues to receive every valid frame.
 | `auto-ignore off` | Disable new automatic ignore rules |
 | `clear-auto` | Remove automatically created rules |
 | `changes-only on` | Hide frames unchanged since their last display |
+| `watch 0x201` | Enable focus mode and show this ID (repeat for more IDs) |
+| `unwatch 0x201` | Remove an ID from the focus set |
+| `watch-clear` | Disable focus mode and return to all IDs |
+| `mark throttle 5` | Observe for 5 seconds and rank changing ID/byte candidates |
+| `mark-stop` | Finish the active event early and print its ranking |
+| `mark-cancel` | Discard the active event capture |
 | `list` | Print the current rule dictionary |
 | `stats` | Print reader, malformed, queue-drop, and device counters |
 | `quit` | Flush the CSV capture and exit |
@@ -336,6 +342,7 @@ Persistent defaults are stored in `analyzer/filter_config.json`:
 ```json
 {
   "ignore_ids": ["0x201", "0x7DF"],
+  "watch_ids": [],
   "rate_limits_hz": {
     "0x100": 10,
     "0x316": 20
@@ -350,11 +357,38 @@ Command-line filters may be repeated:
 ```bash
 python analyzer/can_analyzer.py \
   --port /dev/ttyUSB0 \
+  --watch 0x316 \
   --ignore 0x201 \
   --ignore 0x202 \
   --changes-only \
   --log captures/pedal_sweep.csv
 ```
+
+### Focus/Watch Mode
+
+The analyzer can now isolate interesting arbitration IDs without restarting a
+capture. Type `watch 0x316` while it is running, add more IDs with additional
+`watch` commands, and use `watch-clear` to return to the full stream. Focus mode
+changes console output only, so the CSV remains a lossless record of all valid
+frames received by the host.
+
+### Event Correlation Mode
+
+Type `mark throttle 5`, then perform the action during the five-second window.
+The analyzer observes every valid frame before display filters and ranks the ten
+most active CAN ID/byte candidates by change count, byte range, bit flips, and
+total movement. Labels may describe any controlled action, such as `brake`,
+`steering-left`, or `rpm-sweep`.
+
+```text
+# event 'throttle' armed for 5s; perform the action now
+# event 'throttle' candidates:
+  1. ID 0x316 byte 2: changes=24, range=10-A7, bit_flips=51
+  2. ID 0x329 byte 5: changes=11, range=00-38, bit_flips=19
+```
+
+The ranking is a discovery aid, not proof of signal semantics. Repeat the same
+action, compare controls, and validate candidates across the operating range.
 
 ## 11. CSV Capture Contract
 
@@ -477,7 +511,7 @@ AdvancedCANAnalyzer/
 | `config.hpp` | Pins, queue sizing, serial rate, CAN bitrate, oscillator selection |
 | `mcp2515.hpp/.cpp` | Minimal receive-only SPI driver and validated bit timing |
 | `main.cpp` | ISR, timer-driven initialization, RX task, queue, serial task |
-| `can_analyzer.py` | Serial reader, parser, CSV logger, highlighting, live filters |
+| `can_analyzer.py` | Serial reader, logger, highlighting, live filters, event correlation |
 | `offline_mutator.py` | Receive-capture mutation for offline decoder tests |
 | `filter_config.json` | Persistent ignore/rate/auto-ignore policy |
 | `tests/` | Parser, highlighting, filter, and mutation regression tests |
@@ -493,7 +527,7 @@ python -m unittest discover -s tests -v
 Expected result:
 
 ```text
-Ran 7 tests
+Ran 10 tests
 
 OK
 ```
