@@ -10,7 +10,8 @@ An interrupt-driven, receive-only CAN 2.0B capture probe and desktop
 reverse-engineering toolkit for studying undocumented automotive networks. The
 reference target is a classic ESP32 connected to an MCP2515 and a 3.3 V CAN
 transceiver. The desktop tool logs every accepted frame, highlights byte-level
-changes, and supports live dictionary-backed filtering.
+changes, supports live dictionary-backed filtering, and compares repeated
+baseline/action windows with guided experiment scoring.
 
 The project is suitable for older vehicles and bench networks where the actual
 bitrate, controller oscillator, physical layer, and diagnostic connector wiring
@@ -333,6 +334,11 @@ CSV capture continues to receive every valid frame.
 | `mark throttle 5` | Observe for 5 seconds and rank changing ID/byte candidates |
 | `mark-stop` | Finish the active event early and print its ranking |
 | `mark-cancel` | Discard the active event capture |
+| `experiment start throttle 10 5 3` | Run three guided 10 s baseline / 5 s action trials |
+| `experiment status` | Show the current trial, phase, and remaining time |
+| `experiment stop` | Finish early using completed baseline/action pairs |
+| `experiment cancel` | Discard the active guided experiment |
+| `experiment report` | Print the most recent guided experiment report again |
 | `list` | Print the current rule dictionary |
 | `stats` | Print reader, malformed, queue-drop, and device counters |
 | `quit` | Flush the CSV capture and exit |
@@ -389,6 +395,41 @@ total movement. Labels may describe any controlled action, such as `brake`,
 
 The ranking is a discovery aid, not proof of signal semantics. Repeat the same
 action, compare controls, and validate candidates across the operating range.
+
+### Guided Experiment Mode
+
+Guided experiments compare repeated control periods against repeated action
+periods. Start a three-trial throttle experiment with 10-second baselines and
+5-second action windows:
+
+```text
+experiment start throttle 10 5 3
+```
+
+The optional arguments are `BASELINE_SECONDS ACTION_SECONDS TRIALS`. Omitting
+them uses the same `10 5 3` defaults. The console announces every transition:
+
+```text
+# experiment 'throttle' started: trial 1/3 BASELINE for 10s; keep the control untouched
+# experiment 'throttle': baseline 1/3 complete; ACTION now for 5s
+# experiment 'throttle': action 1/3 complete; trial 2/3 BASELINE for 10s; keep the control untouched
+```
+
+After the final action window, bytes that also changed during the baseline are
+penalized while repeatable action-specific changes are ranked:
+
+```text
+# experiment 'throttle' candidates (3/3 trials):
+  1. ID 0x316 byte 2: confidence=96.4%, repeats=3/3, baseline_change=2.1%, action_change=68.4%, mean_shift=+42.3, trend=increasing
+  2. ID 0x329 byte 5: confidence=73.8%, repeats=3/3, baseline_change=0.0%, action_change=21.7%, mean_shift=-1.0, trend=decreasing
+```
+
+`confidence` is a heuristic combining mean separation, change-rate lift, range
+lift, message-rate lift, and repeat consistency. It is not a probability or
+proof of signal meaning. The experiment observes all valid frames before
+display filters, and CSV logging remains complete and unchanged. Use
+`experiment status`, `experiment stop`, `experiment cancel`, or
+`experiment report` while the analyzer is running.
 
 ## 11. CSV Capture Contract
 
@@ -511,7 +552,7 @@ AdvancedCANAnalyzer/
 | `config.hpp` | Pins, queue sizing, serial rate, CAN bitrate, oscillator selection |
 | `mcp2515.hpp/.cpp` | Minimal receive-only SPI driver and validated bit timing |
 | `main.cpp` | ISR, timer-driven initialization, RX task, queue, serial task |
-| `can_analyzer.py` | Serial reader, logger, highlighting, live filters, event correlation |
+| `can_analyzer.py` | Serial reader, logger, filters, event correlation, guided experiments |
 | `offline_mutator.py` | Receive-capture mutation for offline decoder tests |
 | `filter_config.json` | Persistent ignore/rate/auto-ignore policy |
 | `tests/` | Parser, highlighting, filter, and mutation regression tests |
@@ -527,7 +568,7 @@ python -m unittest discover -s tests -v
 Expected result:
 
 ```text
-Ran 10 tests
+Ran 14 tests
 
 OK
 ```
