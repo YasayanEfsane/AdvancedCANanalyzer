@@ -360,6 +360,121 @@ class EventSession:
     metrics: dict[tuple[int, int], EventMetric] = field(default_factory=dict)
 
 
+@dataclass(slots=True)
+class ExperimentMetric:
+    samples: int = 0
+    transitions: int = 0
+    changes: int = 0
+    total_delta: int = 0
+    bit_flips: int = 0
+    total_value: int = 0
+    minimum: int = 0xFF
+    maximum: int = 0
+
+    def observe(self, value: int, previous: int | None) -> None:
+        self.samples += 1
+        self.total_value += value
+        self.minimum = min(self.minimum, value)
+        self.maximum = max(self.maximum, value)
+        if previous is None:
+            return
+        self.transitions += 1
+        if value != previous:
+            self.changes += 1
+            self.total_delta += abs(value - previous)
+            self.bit_flips += (value ^ previous).bit_count()
+
+    @property
+    def mean(self) -> float:
+        return self.total_value / self.samples if self.samples else 0.0
+
+    @property
+    def span(self) -> int:
+        return self.maximum - self.minimum if self.samples else 0
+
+    @property
+    def change_ratio(self) -> float:
+        return self.changes / self.transitions if self.transitions else 0.0
+
+
+@dataclass(slots=True)
+class ExperimentTrial:
+    baseline: dict[tuple[int, int], ExperimentMetric] = field(default_factory=dict)
+    action: dict[tuple[int, int], ExperimentMetric] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class GuidedExperiment:
+    label: str
+    baseline_s: float
+    action_s: float
+    target_trials: int
+    phase: str
+    deadline_ns: int
+    trials: list[ExperimentTrial] = field(default_factory=list)
+    current: ExperimentTrial = field(default_factory=ExperimentTrial)
+    last_values: dict[int, tuple[int, ...]] = field(default_factory=dict)
+
+    @property
+    def trial_number(self) -> int:
+        return len(self.trials) + 1
+
+    def observe(self, frame: CanFrame) -> None:
+        if frame.remote or frame.dlc == 0:
+            return
+        metrics = self.current.baseline if self.phase == "baseline" else self.current.action
+        previous = self.last_values.get(frame.can_id)
+        for index in range(frame.dlc):
+            metric = metrics.setdefault((frame.can_id, index), ExperimentMetric())
+            prior_value = None if previous is None else previous[index]
+            metric.observe(frame.data[index], prior_value)
+        self.last_values[frame.can_id] = frame.data
+
+    def advance(self, now_ns: int) -> str | None:
+        if now_ns < self.deadline_ns:
+            return None
+        if self.phase == "baseline":
+            self.phase = "action"
+            self.deadline_ns = now_ns + int(self.action_s * 1_000_000_000)
+            self.last_values.clear()
+            return (
+                f"experiment '{self.label}': baseline {self.trial_number}/"
+                f"{self.target_trials} complete; ACTION now for {self.action_s:g}s"
+            )
+
+        completed = self.trial_number
+        self.trials.append(self.current)
+        if completed >= self.target_trials:
+            self.phase = "complete"
+            return (
+                f"experiment '{self.label}': action {completed}/"
+                f"{self.target_trials} complete"
+            )
+
+        self.current = ExperimentTrial()
+        self.phase = "baseline"
+        self.deadline_ns = now_ns + int(self.baseline_s * 1_000_000_000)
+        self.last_values.clear()
+        return (
+            f"experiment '{self.label}': action {completed}/{self.target_trials} "
+            f"complete; trial {completed + 1}/{self.target_trials} BASELINE for "
+            f"{self.baseline_s:g}s; keep the control untouched"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentCandidate:
+    can_id: int
+    byte_index: int
+    confidence: float
+    hits: int
+    trials: int
+    baseline_change_ratio: float
+    action_change_ratio: float
+    mean_shift: float
+    trend: str
+
+
 class Analyzer:
     def __init__(self, filters: DynamicFilters, use_color: bool) -> None:
         self.filters = filters
@@ -368,6 +483,8 @@ class Analyzer:
         # Correlation observes valid frames before console filters are applied.
         self.last_observed: dict[int, tuple[int, ...]] = {}
         self.event_session: EventSession | None = None
+        self.experiment: GuidedExperiment | None = None
+        self.last_experiment_report: str | None = None
         self.displayed = 0
 
     def start_event(self, label: str, duration_s: float = 5.0) -> str:
@@ -439,6 +556,228 @@ class Analyzer:
         self.event_session = None
         return f"event '{label}' cancelled"
 
+    def start_experiment(self, label: str, baseline_s: float = 10.0,
+                         action_s: float = 5.0, trials: int = 3,
+                         now_ns: int | None = None) -> str:
+        label = label.strip()
+        if not label:
+            raise ValueError("experiment label cannot be empty")
+        if self.experiment is not None:
+            raise ValueError("an experiment is already active; stop or cancel it first")
+        if not 0.5 <= baseline_s <= 300.0:
+            raise ValueError("baseline duration must be between 0.5 and 300 seconds")
+        if not 0.5 <= action_s <= 300.0:
+            raise ValueError("action duration must be between 0.5 and 300 seconds")
+        if not 1 <= trials <= 20:
+            raise ValueError("trial count must be between 1 and 20")
+
+        started_ns = time.monotonic_ns() if now_ns is None else now_ns
+        self.experiment = GuidedExperiment(
+            label=label,
+            baseline_s=baseline_s,
+            action_s=action_s,
+            target_trials=trials,
+            phase="baseline",
+            deadline_ns=started_ns + int(baseline_s * 1_000_000_000),
+        )
+        return (
+            f"experiment '{label}' started: trial 1/{trials} BASELINE for "
+            f"{baseline_s:g}s; keep the control untouched"
+        )
+
+    def poll_experiment(self, now_ns: int | None = None) -> str | None:
+        session = self.experiment
+        if session is None:
+            return None
+        current_ns = time.monotonic_ns() if now_ns is None else now_ns
+        notice = session.advance(current_ns)
+        if session.phase != "complete":
+            return notice
+
+        report = self._format_experiment_report(session)
+        self.last_experiment_report = report
+        self.experiment = None
+        return f"{notice}\n{report}" if notice else report
+
+    def observe_experiment(self, frame: CanFrame, now_ns: int) -> str | None:
+        notice = self.poll_experiment(now_ns)
+        if self.experiment is not None:
+            self.experiment.observe(frame)
+        return notice
+
+    def experiment_status(self, now_ns: int | None = None) -> str:
+        session = self.experiment
+        if session is None:
+            return "no active experiment"
+        current_ns = time.monotonic_ns() if now_ns is None else now_ns
+        remaining_s = max(0.0, (session.deadline_ns - current_ns) / 1_000_000_000)
+        return (
+            f"experiment '{session.label}': phase={session.phase}, "
+            f"trial={session.trial_number}/{session.target_trials}, "
+            f"remaining={remaining_s:.1f}s"
+        )
+
+    def finish_experiment(self) -> str:
+        session = self.experiment
+        if session is None:
+            return "no active experiment"
+        if (session.phase == "action" and session.current.baseline
+                and session.current.action):
+            session.trials.append(session.current)
+        self.experiment = None
+        report = self._format_experiment_report(session)
+        self.last_experiment_report = report
+        return report
+
+    def cancel_experiment(self) -> str:
+        if self.experiment is None:
+            return "no active experiment"
+        label = self.experiment.label
+        self.experiment = None
+        return f"experiment '{label}' cancelled; captured trials discarded"
+
+    def _experiment_candidates(
+        self, session: GuidedExperiment
+    ) -> list[ExperimentCandidate]:
+        keys = {
+            key
+            for trial in session.trials
+            for phase in (trial.baseline, trial.action)
+            for key in phase
+        }
+        candidates: list[ExperimentCandidate] = []
+        trial_count = len(session.trials)
+        for can_id, byte_index in keys:
+            effects: list[float] = []
+            shifts: list[float] = []
+            baseline_ratios: list[float] = []
+            action_ratios: list[float] = []
+            directions: list[int] = []
+
+            for trial in session.trials:
+                baseline = trial.baseline.get((can_id, byte_index), ExperimentMetric())
+                action = trial.action.get((can_id, byte_index), ExperimentMetric())
+                baseline_ratios.append(baseline.change_ratio)
+                action_ratios.append(action.change_ratio)
+
+                combined_min = min(
+                    metric.minimum
+                    for metric in (baseline, action)
+                    if metric.samples
+                ) if baseline.samples or action.samples else 0
+                combined_max = max(
+                    metric.maximum
+                    for metric in (baseline, action)
+                    if metric.samples
+                ) if baseline.samples or action.samples else 0
+                observed_span = max(1, combined_max - combined_min)
+
+                if baseline.samples and action.samples:
+                    shift = action.mean - baseline.mean
+                    mean_effect = min(1.0, abs(shift) / observed_span)
+                    # A rolling counter can have a large mean shift simply
+                    # because the action window follows the baseline. Discount
+                    # separation when the byte was already changing constantly.
+                    mean_effect *= max(0.0, 1.0 - baseline.change_ratio)
+                    shifts.append(shift)
+                    directions.append(1 if shift > 0 else -1 if shift < 0 else 0)
+                else:
+                    mean_effect = 0.0
+
+                activity_lift = max(0.0, action.change_ratio - baseline.change_ratio)
+                range_lift = max(0.0, action.span - baseline.span) / max(1, action.span)
+                baseline_rate = baseline.samples / session.baseline_s
+                action_rate = action.samples / session.action_s
+                presence_lift = max(0.0, action_rate - baseline_rate) / max(
+                    1.0, action_rate, baseline_rate
+                )
+                components = (mean_effect, activity_lift, range_lift, presence_lift)
+                weighted_evidence = (
+                    0.55 * mean_effect
+                    + 0.25 * activity_lift
+                    + 0.15 * range_lift
+                    + 0.05 * presence_lift
+                )
+                # Strong evidence of any one kind should remain visible. The
+                # weighted part rewards candidates supported by multiple cues.
+                effects.append(0.65 * max(components) + 0.35 * weighted_evidence)
+
+            hits = sum(effect >= 0.10 for effect in effects)
+            repeatability = hits / trial_count
+            direction_counts = [directions.count(value) for value in (-1, 0, 1)]
+            direction_consistency = (
+                max(direction_counts) / len(directions) if directions else repeatability
+            )
+            mean_effect = sum(effects) / trial_count
+            confidence = 100.0 * min(
+                1.0,
+                mean_effect
+                * (0.55 + 0.25 * repeatability + 0.20 * direction_consistency),
+            )
+            confidence *= 0.70 + 0.30 * min(1.0, trial_count / session.target_trials)
+            if confidence < 5.0:
+                continue
+
+            mean_shift = sum(shifts) / len(shifts) if shifts else 0.0
+            if mean_shift > 0:
+                trend = "increasing"
+            elif mean_shift < 0:
+                trend = "decreasing"
+            else:
+                trend = "activity-only"
+            candidates.append(ExperimentCandidate(
+                can_id=can_id,
+                byte_index=byte_index,
+                confidence=confidence,
+                hits=hits,
+                trials=trial_count,
+                baseline_change_ratio=sum(baseline_ratios) / trial_count,
+                action_change_ratio=sum(action_ratios) / trial_count,
+                mean_shift=mean_shift,
+                trend=trend,
+            ))
+
+        return sorted(
+            candidates,
+            key=lambda candidate: (
+                candidate.confidence,
+                candidate.hits,
+                candidate.action_change_ratio - candidate.baseline_change_ratio,
+            ),
+            reverse=True,
+        )
+
+    def _format_experiment_report(self, session: GuidedExperiment,
+                                  limit: int = 10) -> str:
+        completed = len(session.trials)
+        if not completed:
+            return (
+                f"experiment '{session.label}' stopped: no complete "
+                "baseline/action trials"
+            )
+        ranked = self._experiment_candidates(session)[:limit]
+        if not ranked:
+            return (
+                f"experiment '{session.label}' complete ({completed}/"
+                f"{session.target_trials} trials): no action-specific candidates"
+            )
+
+        rows = [
+            f"experiment '{session.label}' candidates "
+            f"({completed}/{session.target_trials} trials):"
+        ]
+        for rank, candidate in enumerate(ranked, 1):
+            rows.append(
+                f"  {rank}. ID 0x{candidate.can_id:X} byte {candidate.byte_index}: "
+                f"confidence={candidate.confidence:.1f}%, repeats="
+                f"{candidate.hits}/{candidate.trials}, baseline_change="
+                f"{candidate.baseline_change_ratio * 100:.1f}%, action_change="
+                f"{candidate.action_change_ratio * 100:.1f}%, mean_shift="
+                f"{candidate.mean_shift:+.1f}, trend={candidate.trend}"
+            )
+        rows.append("  confidence is heuristic; validate candidates independently")
+        return "\n".join(rows)
+
     def differences(self, frame: CanFrame) -> tuple[set[int], tuple[int, ...] | None]:
         previous = self.last_displayed.get(frame.can_id)
         if previous is None:
@@ -452,6 +791,9 @@ class Analyzer:
     def process(self, frame: CanFrame) -> tuple[str | None, str | None]:
         now_ns = time.monotonic_ns()
         notices: list[str] = []
+        experiment_notice = self.observe_experiment(frame, now_ns)
+        if experiment_notice:
+            notices.append(experiment_notice)
         event_notice = self.observe_event(frame, now_ns)
         if event_notice:
             notices.append(event_notice)
@@ -510,6 +852,12 @@ HELP_TEXT = """Interactive commands (type a command and press Enter):
   mark LABEL [SECONDS]   rank bytes changing during a labeled action
   mark-stop              finish early and print event candidates
   mark-cancel            discard the active event capture
+  experiment start LABEL [BASELINE_S ACTION_S TRIALS]
+                         compare repeated baseline/action windows
+  experiment status      show the active phase and remaining time
+  experiment stop        finish early using completed trial pairs
+  experiment cancel      discard the active guided experiment
+  experiment report      print the most recent experiment report
   list                   show the dictionary-backed filter rules
   stats                  print reader and display counters
   help                   show this help
@@ -595,6 +943,27 @@ def handle_command(command: str, filters: DynamicFilters, stats: ReaderStats,
             return analyzer.finish_event()
         if verb == "mark-cancel" and len(tokens) == 1:
             return analyzer.cancel_event()
+        if verb == "experiment" and len(tokens) >= 2:
+            action = tokens[1].lower()
+            if action == "start" and len(tokens) in {3, 6}:
+                baseline_s = 10.0 if len(tokens) == 3 else float(tokens[3])
+                action_s = 5.0 if len(tokens) == 3 else float(tokens[4])
+                trials = 3 if len(tokens) == 3 else int(tokens[5])
+                return analyzer.start_experiment(
+                    tokens[2], baseline_s, action_s, trials
+                )
+            if action == "status" and len(tokens) == 2:
+                return analyzer.experiment_status()
+            if action == "stop" and len(tokens) == 2:
+                return analyzer.finish_experiment()
+            if action == "cancel" and len(tokens) == 2:
+                return analyzer.cancel_experiment()
+            if action == "report" and len(tokens) == 2:
+                return analyzer.last_experiment_report or "no completed experiment report"
+            raise ValueError(
+                "use: experiment start LABEL [BASELINE_S ACTION_S TRIALS], "
+                "status, stop, cancel, or report"
+            )
         if verb == "list" and len(tokens) == 1:
             rows = []
             watched = ", ".join(f"0x{can_id:X}" for can_id in sorted(filters.watch_ids))
@@ -711,6 +1080,9 @@ def run(arguments: argparse.Namespace) -> int:
     try:
         with CsvCapture(arguments.log) as capture:
             while not stop_event.is_set():
+                experiment_notice = analyzer.poll_experiment()
+                if experiment_notice:
+                    print(f"# {experiment_notice}")
                 while True:
                     try:
                         command = commands.get_nowait()
