@@ -9,9 +9,9 @@
 An interrupt-driven, receive-only CAN 2.0B capture probe and desktop
 reverse-engineering toolkit for studying undocumented automotive networks. The
 reference target is a classic ESP32 connected to an MCP2515 and a 3.3 V CAN
-transceiver. The desktop tool logs every accepted frame, highlights byte-level
-changes, supports live dictionary-backed filtering, and compares repeated
-baseline/action windows with guided experiment scoring.
+transceiver. The desktop tool logs every accepted frame, highlights byte- and
+bit-level changes, supports live dictionary-backed filtering, and compares
+repeated baseline/action windows with guided experiment scoring.
 
 The project is suitable for older vehicles and bench networks where the actual
 bitrate, controller oscillator, physical layer, and diagnostic connector wiring
@@ -334,6 +334,10 @@ CSV capture continues to receive every valid frame.
 | `mark throttle 5` | Observe for 5 seconds and rank changing ID/byte candidates |
 | `mark-stop` | Finish the active event early and print its ranking |
 | `mark-cancel` | Discard the active event capture |
+| `bits on` / `bits off` | Show or hide exact bit transitions on live frame lines |
+| `bit-stats` | Rank the 16 most frequently toggled bits across all IDs |
+| `bit-stats 0x316 8` | Show the top 8 toggling bits for ID `0x316` |
+| `bit-clear` | Clear accumulated bit statistics and reset observation baselines |
 | `experiment start throttle 10 5 3` | Run three guided 10 s baseline / 5 s action trials |
 | `experiment status` | Show the current trial, phase, and remaining time |
 | `experiment stop` | Finish early using completed baseline/action pairs |
@@ -349,6 +353,7 @@ Persistent defaults are stored in `analyzer/filter_config.json`:
 {
   "ignore_ids": ["0x201", "0x7DF"],
   "watch_ids": [],
+  "bit_details": false,
   "rate_limits_hz": {
     "0x100": 10,
     "0x316": 20
@@ -364,6 +369,7 @@ Command-line filters may be repeated:
 python analyzer/can_analyzer.py \
   --port /dev/ttyUSB0 \
   --watch 0x316 \
+  --bit-details \
   --ignore 0x201 \
   --ignore 0x202 \
   --changes-only \
@@ -377,6 +383,47 @@ capture. Type `watch 0x316` while it is running, add more IDs with additional
 `watch` commands, and use `watch-clear` to return to the full stream. Focus mode
 changes console output only, so the CSV remains a lossless record of all valid
 frames received by the host.
+
+### Bit-Level Analyzer
+
+Enable exact transition annotations without restarting the capture:
+
+```text
+bits on
+```
+
+Each displayed frame then appends the changed bit positions and directions:
+
+```text
+12:34:56.140 S123 DLC=8  00  [+11]  20   30   40  [-4F]  60   70  changed=2 bits=d1[b0+] d5[b0+,b1+,b2+,b3+,b4-]
+```
+
+`d0` through `d7` are payload byte positions. `b0` is the least-significant bit
+and `b7` is the most-significant bit. A `+` transition means `0 -> 1`; `-` means
+`1 -> 0`. The live suffix compares against the last displayed frame for that ID,
+so it remains consistent with the existing changed-byte markers.
+
+The analyzer also keeps cumulative statistics before console filters are
+applied:
+
+```text
+bit-stats
+bit-stats 0x316 8
+bit-clear
+```
+
+Example report:
+
+```text
+# bit statistics (ID 0x316, top 2):
+  1. S316 byte 2 bit 3: flips=42, 0->1=21, 1->0=21
+  2. S316 byte 2 bit 7: flips=11, 0->1=6, 1->0=5
+```
+
+This makes isolated switch bits and noisy counters easier to distinguish. The
+statistics are session-local, reset by `bit-clear`, and do not change CSV
+logging. Bit detail display can also be enabled at startup with `--bit-details`
+or `"bit_details": true` in `analyzer/filter_config.json`.
 
 ### Event Correlation Mode
 
@@ -552,7 +599,7 @@ AdvancedCANAnalyzer/
 | `config.hpp` | Pins, queue sizing, serial rate, CAN bitrate, oscillator selection |
 | `mcp2515.hpp/.cpp` | Minimal receive-only SPI driver and validated bit timing |
 | `main.cpp` | ISR, timer-driven initialization, RX task, queue, serial task |
-| `can_analyzer.py` | Serial reader, logger, filters, event correlation, guided experiments |
+| `can_analyzer.py` | Serial logger, filters, bit analysis, correlation, guided experiments |
 | `offline_mutator.py` | Receive-capture mutation for offline decoder tests |
 | `filter_config.json` | Persistent ignore/rate/auto-ignore policy |
 | `tests/` | Parser, highlighting, filter, and mutation regression tests |
@@ -568,7 +615,7 @@ python -m unittest discover -s tests -v
 Expected result:
 
 ```text
-Ran 14 tests
+Ran 19 tests
 
 OK
 ```

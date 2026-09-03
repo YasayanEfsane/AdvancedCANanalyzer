@@ -130,6 +130,7 @@ class DynamicFilters:
         self.last_emit_ns: dict[int, int] = {}
         self.auto_ignore_above_hz: float | None = None
         self.changes_only = False
+        self.bit_details = False
         # An empty watch set means "show every ID". Once populated, it acts as
         # a lightweight allow-list for console output only; CSV capture remains
         # complete and is intentionally unaffected.
@@ -146,6 +147,7 @@ class DynamicFilters:
         automatic = document.get("auto_ignore_above_hz")
         self.auto_ignore_above_hz = None if automatic is None else float(automatic)
         self.changes_only = bool(document.get("changes_only", False))
+        self.bit_details = bool(document.get("bit_details", False))
         self.watch_ids = {
             parse_can_id(str(item)) for item in document.get("watch_ids", [])
         }
@@ -361,6 +363,16 @@ class EventSession:
 
 
 @dataclass(slots=True)
+class BitMetric:
+    rises: int = 0
+    falls: int = 0
+
+    @property
+    def flips(self) -> int:
+        return self.rises + self.falls
+
+
+@dataclass(slots=True)
 class ExperimentMetric:
     samples: int = 0
     transitions: int = 0
@@ -479,12 +491,16 @@ class Analyzer:
     def __init__(self, filters: DynamicFilters, use_color: bool) -> None:
         self.filters = filters
         self.use_color = use_color
-        self.last_displayed: dict[int, tuple[int, ...]] = {}
+        self.last_displayed: dict[tuple[str, int], tuple[int, ...]] = {}
         # Correlation observes valid frames before console filters are applied.
         self.last_observed: dict[int, tuple[int, ...]] = {}
         self.event_session: EventSession | None = None
         self.experiment: GuidedExperiment | None = None
         self.last_experiment_report: str | None = None
+        self.show_bit_details = filters.bit_details
+        # Bit statistics observe all valid data frames before display filters.
+        self.last_bit_observed: dict[tuple[str, int], tuple[int, ...]] = {}
+        self.bit_metrics: dict[tuple[str, int, int, int], BitMetric] = {}
         self.displayed = 0
 
     def start_event(self, label: str, duration_s: float = 5.0) -> str:
@@ -555,6 +571,70 @@ class Analyzer:
         label = self.event_session.label
         self.event_session = None
         return f"event '{label}' cancelled"
+
+    def observe_bits(self, frame: CanFrame) -> None:
+        if frame.remote or frame.dlc == 0:
+            return
+        identity = (frame.frame_type, frame.can_id)
+        previous = self.last_bit_observed.get(identity)
+        self.last_bit_observed[identity] = frame.data
+        if previous is None:
+            return
+
+        for byte_index in range(frame.dlc):
+            changed_mask = previous[byte_index] ^ frame.data[byte_index]
+            for bit_index in range(8):
+                mask = 1 << bit_index
+                if not changed_mask & mask:
+                    continue
+                metric = self.bit_metrics.setdefault(
+                    (frame.frame_type, frame.can_id, byte_index, bit_index),
+                    BitMetric(),
+                )
+                if frame.data[byte_index] & mask:
+                    metric.rises += 1
+                else:
+                    metric.falls += 1
+
+    def bit_statistics(self, can_id: int | None = None, limit: int = 16) -> str:
+        if not 1 <= limit <= 100:
+            raise ValueError("bit statistics limit must be between 1 and 100")
+        ranked = [
+            (key, metric)
+            for key, metric in self.bit_metrics.items()
+            if can_id is None or key[1] == can_id
+        ]
+        ranked.sort(
+            key=lambda item: (
+                -item[1].flips,
+                item[0][0],
+                item[0][1],
+                item[0][2],
+                item[0][3],
+            )
+        )
+        if not ranked:
+            scope = "" if can_id is None else f" for ID 0x{can_id:X}"
+            return f"no bit transitions observed{scope}"
+
+        scope = "all IDs" if can_id is None else f"ID 0x{can_id:X}"
+        rows = [f"bit statistics ({scope}, top {min(limit, len(ranked))}):"]
+        for rank, ((frame_type, frame_id, byte_index, bit_index), metric) in enumerate(
+            ranked[:limit], 1
+        ):
+            width = 8 if frame_type in {"E", "X"} else 3
+            label = f"{frame_type}{frame_id:0{width}X}"
+            rows.append(
+                f"  {rank}. {label} byte {byte_index} bit {bit_index}: "
+                f"flips={metric.flips}, 0->1={metric.rises}, 1->0={metric.falls}"
+            )
+        return "\n".join(rows)
+
+    def clear_bit_statistics(self) -> str:
+        count = len(self.bit_metrics)
+        self.bit_metrics.clear()
+        self.last_bit_observed.clear()
+        return f"cleared {count} bit statistic(s); observation baselines reset"
 
     def start_experiment(self, label: str, baseline_s: float = 10.0,
                          action_s: float = 5.0, trials: int = 3,
@@ -779,7 +859,7 @@ class Analyzer:
         return "\n".join(rows)
 
     def differences(self, frame: CanFrame) -> tuple[set[int], tuple[int, ...] | None]:
-        previous = self.last_displayed.get(frame.can_id)
+        previous = self.last_displayed.get((frame.frame_type, frame.can_id))
         if previous is None:
             return set(range(frame.dlc)), None
         changed = {
@@ -791,6 +871,7 @@ class Analyzer:
     def process(self, frame: CanFrame) -> tuple[str | None, str | None]:
         now_ns = time.monotonic_ns()
         notices: list[str] = []
+        self.observe_bits(frame)
         experiment_notice = self.observe_experiment(frame, now_ns)
         if experiment_notice:
             notices.append(experiment_notice)
@@ -807,7 +888,7 @@ class Analyzer:
         if not self.filters.should_display(frame, changed, now_ns):
             return None, "\n".join(notices) if notices else None
 
-        self.last_displayed[frame.can_id] = frame.data
+        self.last_displayed[(frame.frame_type, frame.can_id)] = frame.data
         self.displayed += 1
         return self.format(frame, changed, previous), "\n".join(notices) if notices else None
 
@@ -829,10 +910,29 @@ class Analyzer:
                 rendered.append(self._paint(GREEN, f"[+{value:02X}]"))
             else:
                 rendered.append(self._paint(RED, f"[-{value:02X}]"))
+        bit_details = self._format_bit_changes(frame, previous)
         return (
             f"{timestamp} {label} DLC={frame.dlc} "
-            f"{' '.join(rendered)}  changed={len(changed)}"
+            f"{' '.join(rendered)}  changed={len(changed)}{bit_details}"
         )
+
+    def _format_bit_changes(
+        self, frame: CanFrame, previous: tuple[int, ...] | None
+    ) -> str:
+        if not self.show_bit_details or previous is None or frame.remote:
+            return ""
+        groups: list[str] = []
+        for byte_index in range(frame.dlc):
+            changed_mask = previous[byte_index] ^ frame.data[byte_index]
+            transitions = []
+            for bit_index in range(8):
+                mask = 1 << bit_index
+                if changed_mask & mask:
+                    direction = "+" if frame.data[byte_index] & mask else "-"
+                    transitions.append(f"b{bit_index}{direction}")
+            if transitions:
+                groups.append(f"d{byte_index}[{','.join(transitions)}]")
+        return f" bits={' '.join(groups)}" if groups else ""
 
     def _paint(self, color: str, value: str) -> str:
         return f"{color}{value}{RESET}" if self.use_color else value
@@ -852,6 +952,9 @@ HELP_TEXT = """Interactive commands (type a command and press Enter):
   mark LABEL [SECONDS]   rank bytes changing during a labeled action
   mark-stop              finish early and print event candidates
   mark-cancel            discard the active event capture
+  bits on|off            show exact bit transitions on live frame lines
+  bit-stats [ID [LIMIT]] rank accumulated bit flips; default top 16
+  bit-clear              clear bit statistics and reset their baselines
   experiment start LABEL [BASELINE_S ACTION_S TRIALS]
                          compare repeated baseline/action windows
   experiment status      show the active phase and remaining time
@@ -943,6 +1046,21 @@ def handle_command(command: str, filters: DynamicFilters, stats: ReaderStats,
             return analyzer.finish_event()
         if verb == "mark-cancel" and len(tokens) == 1:
             return analyzer.cancel_event()
+        if verb == "bits" and len(tokens) in {1, 2}:
+            if len(tokens) == 1:
+                state = "on" if analyzer.show_bit_details else "off"
+                return f"bit details={state}, tracked_bits={len(analyzer.bit_metrics)}"
+            if tokens[1].lower() not in {"on", "off"}:
+                raise ValueError("use: bits on or bits off")
+            analyzer.show_bit_details = tokens[1].lower() == "on"
+            filters.bit_details = analyzer.show_bit_details
+            return f"bit details={'on' if analyzer.show_bit_details else 'off'}"
+        if verb == "bit-stats" and len(tokens) in {1, 2, 3}:
+            can_id = None if len(tokens) == 1 else parse_can_id(tokens[1])
+            limit = 16 if len(tokens) < 3 else int(tokens[2])
+            return analyzer.bit_statistics(can_id, limit)
+        if verb == "bit-clear" and len(tokens) == 1:
+            return analyzer.clear_bit_statistics()
         if verb == "experiment" and len(tokens) >= 2:
             action = tokens[1].lower()
             if action == "start" and len(tokens) in {3, 6}:
@@ -968,6 +1086,7 @@ def handle_command(command: str, filters: DynamicFilters, stats: ReaderStats,
             rows = []
             watched = ", ".join(f"0x{can_id:X}" for can_id in sorted(filters.watch_ids))
             rows.append(f"watch={watched or 'all IDs'}")
+            rows.append(f"bit_details={'on' if analyzer.show_bit_details else 'off'}")
             for can_id, rule in sorted(filters.rules.items()):
                 rows.append(
                     f"0x{can_id:X}: ignored={rule.ignored}, "
@@ -998,6 +1117,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ignore", action="append", default=[], metavar="ID")
     parser.add_argument("--watch", action="append", default=[], metavar="ID",
                         help="show only selected CAN ID(s); may be repeated")
+    parser.add_argument("--bit-details", action="store_true",
+                        help="append exact changed-bit directions to displayed frames")
     parser.add_argument("--changes-only", action="store_true")
     parser.add_argument("--auto-ignore-hz", type=float)
     parser.add_argument("--queue-size", type=int, default=20000)
@@ -1026,6 +1147,8 @@ def run(arguments: argparse.Namespace) -> int:
         filters.rules.setdefault(parse_can_id(item), FilterRule()).ignored = True
     for item in arguments.watch:
         filters.watch_ids.add(parse_can_id(item))
+    if arguments.bit_details:
+        filters.bit_details = True
     if arguments.changes_only:
         filters.changes_only = True
     if arguments.auto_ignore_hz is not None:

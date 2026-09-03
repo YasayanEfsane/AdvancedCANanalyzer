@@ -1,6 +1,7 @@
 {
   "ignore_ids": [],
   "watch_ids": [],
+  "bit_details": false,
   "rate_limits_hz": {},
   "auto_ignore_above_hz": null,
   "changes_only": false

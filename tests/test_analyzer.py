@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sys
-import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +14,8 @@ from can_analyzer import (  # noqa: E402
     CanFrame,
     DynamicFilters,
     FilterRule,
+    ReaderStats,
+    handle_command,
     parse_frame_line,
 )
 
@@ -62,6 +64,64 @@ class AnalyzerTests(unittest.TestCase):
         assert rendered is not None
         self.assertIn("[+11]", rendered)
         self.assertIn("[-1F]", rendered)
+
+    def test_bit_details_show_exact_rises_and_falls(self) -> None:
+        analyzer = Analyzer(DynamicFilters(), use_color=False)
+        analyzer.show_bit_details = True
+        analyzer.process(self.frame(0x100, 0x00, 0x03))
+        rendered, _ = analyzer.process(self.frame(0x100, 0x05, 0x01))
+        self.assertIsNotNone(rendered)
+        assert rendered is not None
+        self.assertIn("bits=d0[b0+,b2+] d1[b1-]", rendered)
+
+    def test_bit_details_keep_standard_and_extended_ids_separate(self) -> None:
+        analyzer = Analyzer(DynamicFilters(), use_color=False)
+        analyzer.show_bit_details = True
+        standard = parse_frame_line("S123:1:00,00,00,00,00,00,00,00", 1)
+        extended = parse_frame_line("E00000123:1:01,00,00,00,00,00,00,00", 2)
+        assert standard is not None and extended is not None
+        analyzer.process(standard)
+        rendered, _ = analyzer.process(extended)
+        self.assertIsNotNone(rendered)
+        assert rendered is not None
+        self.assertIn("[*01]", rendered)
+        self.assertNotIn("bits=", rendered)
+
+    def test_bit_statistics_include_filtered_frames(self) -> None:
+        filters = DynamicFilters()
+        filters.rules[0x100] = FilterRule(ignored=True)
+        analyzer = Analyzer(filters, use_color=False)
+        self.assertIsNone(analyzer.process(self.frame(0x100, 0x00, 0x00))[0])
+        self.assertIsNone(analyzer.process(self.frame(0x100, 0x05, 0x00))[0])
+        report = analyzer.bit_statistics(0x100)
+        self.assertIn("S100 byte 0 bit 0: flips=1, 0->1=1, 1->0=0", report)
+        self.assertIn("S100 byte 0 bit 2: flips=1, 0->1=1, 1->0=0", report)
+
+    def test_bit_clear_resets_metrics_and_observation_baseline(self) -> None:
+        analyzer = Analyzer(DynamicFilters(), use_color=False)
+        analyzer.process(self.frame(0x100, 0x00, 0x00))
+        analyzer.process(self.frame(0x100, 0x01, 0x00))
+        self.assertIn("cleared 1 bit statistic", analyzer.clear_bit_statistics())
+        self.assertEqual(analyzer.bit_statistics(), "no bit transitions observed")
+        analyzer.process(self.frame(0x100, 0x00, 0x00))
+        self.assertEqual(analyzer.bit_statistics(), "no bit transitions observed")
+
+    def test_bit_commands_control_details_and_report_scope(self) -> None:
+        filters = DynamicFilters()
+        analyzer = Analyzer(filters, use_color=False)
+        stop_event = threading.Event()
+        self.assertEqual(
+            handle_command("bits on", filters, ReaderStats(), analyzer, stop_event),
+            "bit details=on",
+        )
+        analyzer.process(self.frame(0x100, 0x00, 0x00))
+        analyzer.process(self.frame(0x100, 0x01, 0x00))
+        report = handle_command(
+            "bit-stats 0x100 1", filters, ReaderStats(), analyzer, stop_event
+        )
+        self.assertIsNotNone(report)
+        assert report is not None
+        self.assertIn("bit statistics (ID 0x100, top 1)", report)
 
     def test_ignore_rule_suppresses_display(self) -> None:
         filters = DynamicFilters()
